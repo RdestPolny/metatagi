@@ -135,13 +135,15 @@ ZASADY TWORZENIA META TITLE:
 - Bądź konkretny i zachęcający do kliknięcia
 - NIGDY nie dodawaj na końcu nazwy sklepu, brandu ani domeny
 - NIE używaj separatorów z nazwą sklepu na końcu
+- Używaj TYLKO zwykłego myślnika "-" (nie używaj długiego myślnika "—")
+- NIE używaj kropek w meta title
 - Skup się tylko na produkcie i jego kluczowych cechach
 
 ZASADY TWORZENIA META DESCRIPTION:
 - Maksymalnie 160 znaków (włącznie ze spacjami)
-- DOKŁADNIE DWA krótkie zdania informacyjne
-- Pierwsze zdanie: główna cecha/wartość produktu
-- Drugie zdanie: dodatkowa korzyść lub call-to-action
+- DOKŁADNIE DWA krótkie zdania informacyjne o produkcie
+- ZAKAZ używania call-to-action (np. "Sprawdź", "Kup teraz", "Zamów")
+- Tylko obiektywne informacje o produkcie i jego cechach
 - Naturalne użycie słów kluczowych
 - Jasno komunikuj wartość produktu
 - Bez nazwy sklepu ani brandu
@@ -177,6 +179,12 @@ Stwórz zoptymalizowane SEO metatagi dla tego produktu."""
                 meta_title = line[len("meta title:"):].strip()
             elif line.lower().startswith("meta description:"):
                 meta_description = line[len("meta description:"):].strip()
+        
+        # Zamiana długiego myślnika na zwykły
+        meta_title = meta_title.replace('—', '-')
+        
+        # Usuwanie kropek z meta title
+        meta_title = meta_title.replace('.', '')
         
         # Walidacja długości
         if len(meta_title) > 60:
@@ -263,8 +271,10 @@ st.sidebar.info("💡 **Wskazówka:** Zielony status 🟢 oznacza poprawną dłu
 st.sidebar.markdown("---")
 st.sidebar.subheader("✅ Standardy SEO")
 st.sidebar.markdown("""
+- **Meta Title:** Tylko zwykły myślnik "-"
 - **Meta Title:** Bez nazwy sklepu/brandu
-- **Meta Description:** Dokładnie 2 zdania
+- **Meta Description:** 2 zdania informacyjne
+- **Meta Description:** Bez CTA
 - Skupienie na produkcie i jego wartości
 """)
 
@@ -381,9 +391,9 @@ if st.session_state.results:
             use_container_width=True
         )
     
-    # Szczegółowe wyniki
+    # Szczegółowe wyniki - TABELA
     st.markdown("---")
-    st.subheader("📋 Szczegółowe wyniki")
+    st.subheader("📋 Wyniki w formie tabeli")
     
     # Filtrowanie
     show_filter = st.radio(
@@ -399,54 +409,53 @@ if st.session_state.results:
     else:
         displayed_results = results
     
-    # Wyświetlanie kart z wynikami
-    for i, result in enumerate(displayed_results, 1):
-        if result['error']:
-            with st.expander(f"❌ [{i}] Błąd: {result['url'][:60]}...", expanded=False):
-                st.error(result['error'])
-                st.write(f"**URL:** {result['url']}")
-                if result['sku']:
-                    st.write(f"**SKU:** {result['sku']}")
-                if result['isbn']:
-                    st.write(f"**ISBN:** {result['isbn']}")
-        else:
-            title_status = "🟢" if result['meta_title_length'] <= 60 else "🟡"
-            desc_status = "🟢" if result['meta_desc_length'] <= 160 else "🟡"
-            
-            with st.expander(
-                f"✅ [{i}] {result['title'][:50]}... {title_status} {desc_status}",
-                expanded=False
-            ):
-                st.write(f"**🌐 URL:** {result['url']}")
-                if result['sku']:
-                    st.write(f"**🏷️ SKU:** {result['sku']}")
-                if result['isbn']:
-                    st.write(f"**📚 ISBN:** {result['isbn']}")
-                st.write(f"**📦 Tytuł produktu:** {result['title']}")
+    # Tworzenie tabeli dla wszystkich wyników
+    if displayed_results:
+        table_data = []
+        for result in displayed_results:
+            if result['error']:
+                # Wiersz z błędem
+                table_data.append({
+                    'Status': '❌',
+                    'SKU': result['sku'] if result['sku'] else '-',
+                    'ISBN': result['isbn'] if result['isbn'] else '-',
+                    'Meta Title': f"BŁĄD: {result['error'][:50]}...",
+                    'Meta Description': '-',
+                    'Długość T': '-',
+                    'Długość D': '-'
+                })
+            else:
+                # Wiersz z sukcesem
+                title_status = '🟢' if result['meta_title_length'] <= 60 else '🟡'
+                desc_status = '🟢' if result['meta_desc_length'] <= 160 else '🟡'
                 
-                st.markdown("---")
-                
-                # Meta Title
-                col_t1, col_t2 = st.columns([4, 1])
-                with col_t1:
-                    st.markdown(f"**Meta Title:**")
-                    if result['meta_title_length'] <= 60:
-                        st.success(result['meta_title'])
-                    else:
-                        st.warning(result['meta_title'])
-                with col_t2:
-                    st.metric("Długość", f"{result['meta_title_length']}/60")
-                
-                # Meta Description
-                col_d1, col_d2 = st.columns([4, 1])
-                with col_d1:
-                    st.markdown(f"**Meta Description:**")
-                    if result['meta_desc_length'] <= 160:
-                        st.success(result['meta_description'])
-                    else:
-                        st.warning(result['meta_description'])
-                with col_d2:
-                    st.metric("Długość", f"{result['meta_desc_length']}/160")
+                table_data.append({
+                    'Status': f"{title_status}{desc_status}",
+                    'SKU': result['sku'] if result['sku'] else '-',
+                    'ISBN': result['isbn'] if result['isbn'] else '-',
+                    'Meta Title': result['meta_title'],
+                    'Meta Description': result['meta_description'],
+                    'Długość T': f"{result['meta_title_length']}/60",
+                    'Długość D': f"{result['meta_desc_length']}/160"
+                })
+        
+        df_display = pd.DataFrame(table_data)
+        
+        # Konfiguracja wyświetlania kolumn
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Status": st.column_config.TextColumn("", width="small"),
+                "SKU": st.column_config.TextColumn("SKU", width="small"),
+                "ISBN": st.column_config.TextColumn("ISBN", width="small"),
+                "Meta Title": st.column_config.TextColumn("Meta Title", width="large"),
+                "Meta Description": st.column_config.TextColumn("Meta Description", width="large"),
+                "Długość T": st.column_config.TextColumn("Dł. T", width="small"),
+                "Długość D": st.column_config.TextColumn("Dł. D", width="small"),
+            }
+        )
 
 # Stopka
 st.markdown("---")
