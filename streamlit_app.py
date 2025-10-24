@@ -3,7 +3,9 @@
 import asyncio
 import json
 import math
+import random
 import re
+import time
 import textwrap
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -19,12 +21,24 @@ from openai import OpenAI
 # ----------------------- USTAWIENIA STRONY ----------------------- #
 st.set_page_config(page_title="Generator Metatagów SEO", page_icon="🏷️", layout="wide")
 
-# ----------------------- AUTO-WYKRYWANIE HTTP/2 ------------------ #
+# ----------------------- AUTO-WYKRYWANIE OPCJONALNYCH NARZĘDZI --- #
 try:
     import h2  # noqa: F401
     HTTP2_AVAILABLE = True
 except Exception:
     HTTP2_AVAILABLE = False
+
+try:
+    from curl_cffi import requests as curlreq  # type: ignore
+    CURLCFFI_AVAILABLE = True
+except Exception:
+    CURLCFFI_AVAILABLE = False
+
+try:
+    import cloudscraper  # type: ignore
+    CLOUDSCRAPER_AVAILABLE = True
+except Exception:
+    CLOUDSCRAPER_AVAILABLE = False
 
 # ----------------------- STAŁE / SŁOWNIKI ------------------------ #
 CTA_WORDS = {
@@ -34,7 +48,6 @@ CTA_WORDS = {
 }
 
 ATTRIBUTE_KEYS = {
-    # normalizacja najczęściej spotykanych etykiet
     "materiał": ["materiał", "material", "surowiec"],
     "wiek": ["wiek", "od lat", "wiek dziecka", "age range", "wiek rekomendowany"],
     "format": ["format", "rozmiar", "wymiar", "wymiary", "size", "dimensions"],
@@ -44,6 +57,20 @@ ATTRIBUTE_KEYS = {
     "kolor": ["kolor", "barwa", "color"],
     "pojemność": ["pojemność", "capacity", "objętość"],
     "typ": ["typ", "rodzaj", "type"],
+}
+
+BROWSER_UAS = [
+    # kilkanaście popularnych UA – prosty rotating pool
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+SEC_CH = {
+    "sec-ch-ua": '"Chromium";v="126", "Not;A=Brand";v="99", "Google Chrome";v="126"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
 }
 
 LLM_MODEL = "gpt-5-nano"
@@ -88,8 +115,7 @@ def clean_text(s: str) -> str:
     if not s:
         return ""
     s = s.replace("\xa0", " ")
-    s = re.sub(r"\s+", " ", s)
-    s = s.strip()
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def trim_words(text: str, limit: int) -> str:
@@ -104,27 +130,22 @@ def trim_words(text: str, limit: int) -> str:
     return out_text if out_text else text[: max(0, limit - 1)].rstrip() + "…"
 
 def normalize_title(title: str) -> str:
-    t = title.replace("—", "-")
-    t = t.replace("…", "")
-    # usuń kropki w TITLE
+    t = title.replace("—", "-").replace("…", "")
     t = t.replace(".", "")
-    t = re.sub(r"\s*-\s*", " - ", t)  # otoczenie myślnika spacjami
+    t = re.sub(r"\s*-\s*", " - ", t)
     t = re.sub(r"\s{2,}", " ", t).strip()
     return t
 
 def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
     t = clean_text(desc)
-    # usuń CTA
     for w in CTA_WORDS:
         t = re.sub(rf"\b{re.escape(w)}\b", "", t, flags=re.I)
     t = re.sub(r"\s{2,}", " ", t).strip()
-
     parts = re.split(r"(?<=[\.\?\!])\s+", t) if t else []
     parts = [p.strip() for p in parts if p.strip()]
 
     def make_fact_from_attr(hint: str) -> str:
-        hint = clean_text(hint)
-        hint = hint[:120]
+        hint = clean_text(hint)[:120]
         return hint or "Zawiera kluczowe cechy produktu"
 
     if len(parts) == 0:
@@ -132,30 +153,22 @@ def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
         s2 = make_fact_from_attr(attrib_hint) + "."
         t = f"{s1} {s2}"
     elif len(parts) == 1:
+        s1 = parts[0] + ("" if re.search(r"[\.!\?]$", parts[0]) else ".")
         s2 = make_fact_from_attr(attrib_hint) + "."
-        s1 = parts[0]
-        if not re.search(r"[\.!\?]$", s1):
-            s1 += "."
         t = f"{s1} {s2}"
     else:
         s1, s2 = parts[0], parts[1]
-        if not re.search(r"[\.!\?]$", s1):
-            s1 += "."
-        if not re.search(r"[\.!\?]$", s2):
-            s2 += "."
+        if not re.search(r"[\.!\?]$", s1): s1 += "."
+        if not re.search(r"[\.!\?]$", s2): s2 += "."
         t = f"{s1} {s2}"
-
     return trim_words(t, MAX_DESC)
 
 def compress_attributes(attrs: Dict[str, str]) -> str:
-    if not attrs:
-        return ""
+    if not attrs: return ""
     pairs = []
     for k, v in attrs.items():
-        k = clean_text(k)
-        v = clean_text(v)
-        if k and v:
-            pairs.append(f"{k}: {v}")
+        k, v = clean_text(k), clean_text(v)
+        if k and v: pairs.append(f"{k}: {v}")
     return "; ".join(pairs)
 
 # ----------------------- SCRAPING / PARSING ---------------------- #
@@ -172,8 +185,7 @@ def extract_jsonld_product(soup: bs) -> Dict[str, Any]:
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "")
-            if isinstance(data, dict):
-                data = [data]
+            if isinstance(data, dict): data = [data]
             for d in data:
                 t = d.get("@type")
                 if isinstance(t, list):
@@ -185,19 +197,16 @@ def extract_jsonld_product(soup: bs) -> Dict[str, Any]:
     return items[0] if items else {}
 
 def extract_isbn(text: str) -> str:
-    if not text:
-        return ""
+    if not text: return ""
     m = re.search(r"\b97[89][- ]?\d{1,5}[- ]?\d{1,7}[- ]?\d{1,7}[- ]?\d\b", text)
     return m.group(0).replace(" ", "").replace("-", "") if m else ""
 
 def parse_attributes_from_details(details_root: Tag) -> Dict[str, str]:
     attrs: Dict[str, str] = {}
-    if not details_root:
-        return attrs
+    if not details_root: return attrs
     for li in details_root.find_all("li"):
         txt = clean_text(li.get_text(" ", strip=True))
-        if not txt:
-            continue
+        if not txt: continue
         if ":" in txt:
             lab, val = txt.split(":", 1)
         elif "–" in txt:
@@ -206,28 +215,95 @@ def parse_attributes_from_details(details_root: Tag) -> Dict[str, str]:
             lab, val = txt.split("-", 1)
         else:
             continue
-        lab = clean_text(lab)
-        val = clean_text(val)
+        lab, val = clean_text(lab), clean_text(val)
         key = map_attribute_label(lab)
-        if key and val:
-            attrs.setdefault(key, val)
+        if key and val: attrs.setdefault(key, val)
     return attrs
 
-async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
-    r = await client.get(url, timeout=httpx.Timeout(20.0, connect=5.0))
+# -------------- FETCH: WIELOETAPOWE OMIJANIE PROSTYCH BLOKAD ----- #
+def base_headers(u: str) -> Dict[str, str]:
+    host = urlparse(u).hostname or ""
+    ua = random.choice(BROWSER_UAS)
+    return {
+        "User-Agent": ua,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+        "Referer": f"https://{host}/",
+        **SEC_CH,
+    }
+
+async def fetch_via_httpx(url: str, max_retries: int = 3) -> str:
+    backoff = 0.8
+    for attempt in range(1, max_retries + 1):
+        headers = base_headers(url)
+        try:
+            async with httpx.AsyncClient(
+                headers=headers, follow_redirects=True, http2=HTTP2_AVAILABLE
+            ) as client:
+                r = await client.get(url, timeout=httpx.Timeout(25.0, connect=7.0))
+                if r.status_code == 403:
+                    raise httpx.HTTPStatusError("403 Forbidden", request=r.request, response=r)
+                r.raise_for_status()
+                return r.text
+        except Exception as e:
+            if attempt == max_retries:
+                raise
+            # mały jitter, zmiana UA i sek-ch
+            await asyncio.sleep(backoff + random.uniform(0, 0.6))
+            backoff *= 1.6
+    raise RuntimeError("Unreachable")
+
+def fetch_via_curlcffi(url: str) -> str:
+    # TLS fingerprint + JA3 jak Chrome – często wystarcza
+    resp = curlreq.get(
+        url,
+        headers=base_headers(url),
+        impersonate="chrome",
+        timeout=25,
+        allow_redirects=True,
+    )
+    if resp.status_code == 403:
+        raise RuntimeError("403 via curl_cffi")
+    resp.raise_for_status()
+    return resp.text
+
+def fetch_via_cloudscraper(url: str) -> str:
+    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
+    r = scraper.get(url, headers=base_headers(url), timeout=25)
+    if r.status_code == 403:
+        raise RuntimeError("403 via cloudscraper")
     r.raise_for_status()
     return r.text
 
-async def scrape_product(url: str) -> ProductData:
-    headers = {
-        "User-Agent": "Mozilla/5.0 (compatible; MetaTagsBot/1.0; +https://example.com/bot)",
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8",
-        "Accept-Encoding": "gzip, deflate, br",
-    }
+async def robust_fetch_html(url: str) -> str:
+    # Plan A: httpx + retry
     try:
-        # AUTO: http2=HTTP2_AVAILABLE – brak h2 => przełącza na HTTP/1.1
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, http2=HTTP2_AVAILABLE) as client:
-            html = await fetch_html(client, url)
+        return await fetch_via_httpx(url)
+    except Exception as e_httpx:
+        # Plan B: curl_cffi (sync) – uruchom w wątku
+        if CURLCFFI_AVAILABLE:
+            try:
+                return await asyncio.to_thread(fetch_via_curlcffi, url)
+            except Exception as e_curl:
+                last = f"httpx fail: {e_httpx} | curl_cffi fail: {e_curl}"
+        else:
+            last = f"httpx fail: {e_httpx} | curl_cffi not installed"
+
+        # Plan C: cloudscraper (sync) – w wątku
+        if CLOUDSCRAPER_AVAILABLE:
+            try:
+                return await asyncio.to_thread(fetch_via_cloudscraper, url)
+            except Exception as e_cloud:
+                raise RuntimeError(f"{last} | cloudscraper fail: {e_cloud}")
+        raise RuntimeError(last)
+
+# ----------------------- SCRAPER GŁÓWNY ------------------------- #
+async def scrape_product(url: str) -> ProductData:
+    try:
+        html = await robust_fetch_html(url)
     except Exception as e:
         return ProductData(url=url, error=f"Błąd pobierania: {e}")
 
@@ -236,11 +312,9 @@ async def scrape_product(url: str) -> ProductData:
     except Exception:
         soup = bs(html, "html.parser")
 
-    # Tytuł
     title_tag = soup.find("h1") or soup.find("h1", attrs={"itemprop": "name"})
     title = clean_text(title_tag.get_text(strip=True)) if title_tag else ""
 
-    # JSON-LD
     ld = extract_jsonld_product(soup)
     ld_name = clean_text(ld.get("name", "")) if ld else ""
     ld_desc = clean_text(ld.get("description", "")) if ld else ""
@@ -249,8 +323,7 @@ async def scrape_product(url: str) -> ProductData:
     if not ld_isbn:
         try:
             ap = ld.get("additionalProperty") or []
-            if isinstance(ap, dict):
-                ap = [ap]
+            if isinstance(ap, dict): ap = [ap]
             for p in ap:
                 if str(p.get("name", "")).lower() == "isbn":
                     ld_isbn = clean_text(p.get("value", ""))
@@ -258,17 +331,15 @@ async def scrape_product(url: str) -> ProductData:
         except Exception:
             pass
 
-    # Opis
     description_text = ""
-    desc_candidates = [
+    for tag, attrs in [
         ("div", {"class": "desc-container"}),
         ("div", {"id": "product-description"}),
         ("div", {"itemprop": "description"}),
         ("section", {"id": "description"}),
         ("div", {"class": "product-description"}),
         ("article", {}),
-    ]
-    for tag, attrs in desc_candidates:
+    ]:
         node = soup.find(tag, attrs=attrs)
         if node:
             art = node.find("article") or node
@@ -276,7 +347,6 @@ async def scrape_product(url: str) -> ProductData:
             if description_text:
                 break
 
-    # Smyk spec
     if "smyk.com" in url and not description_text:
         smyk_desc_div = soup.find("div", attrs={"data-testid": "box-attributes__simple"})
         if smyk_desc_div:
@@ -285,7 +355,6 @@ async def scrape_product(url: str) -> ProductData:
                     p_tag.decompose()
             description_text = clean_text(smyk_desc_div.get_text(separator="\n", strip=True))
 
-    # Szczegóły / atrybuty
     details_root = (
         soup.find("div", id="szczegoly")
         or soup.find("div", class_="product-features")
@@ -294,10 +363,8 @@ async def scrape_product(url: str) -> ProductData:
     )
     attributes = parse_attributes_from_details(details_root) if details_root else {}
 
-    # ISBN
     isbn = ld_isbn or extract_isbn(ld_desc or description_text or html)
 
-    # Kategoria
     category = ld_category
     if not category:
         bc = soup.find("nav", {"aria-label": re.compile("breadcrumb", re.I)}) or soup.find("ul", class_="breadcrumbs")
@@ -305,7 +372,6 @@ async def scrape_product(url: str) -> ProductData:
             cat = clean_text(bc.get_text(" > ", strip=True))
             category = cat.split(">")[-1].strip() if ">" in cat else cat
 
-    # Tytuł/Opis – preferuj JSON-LD
     if ld_name and len(ld_name) > 4:
         title = ld_name
     description = ld_desc if len(ld_desc) > 30 else description_text
@@ -359,8 +425,7 @@ def build_user_prompt(pd: ProductData, brand_block: str) -> str:
 def postprocess_llm_output(meta_title: str, meta_description: str, banned_words: List[str]) -> Tuple[str, str]:
     meta_title = normalize_title(meta_title)
     for w in banned_words:
-        if not w:
-            continue
+        if not w: continue
         meta_title = re.sub(rf"\b{re.escape(w)}\b", "", meta_title, flags=re.I)
         meta_description = re.sub(rf"\b{re.escape(w)}\b", "", meta_description, flags=re.I)
     meta_description = ensure_two_sentences(meta_description, "")
@@ -499,7 +564,6 @@ if "results" not in st.session_state:
 client = OpenAI()
 
 col_btn1, col_btn2 = st.columns([3, 1])
-
 with col_btn1:
     gen_clicked = st.button("🚀 Generuj metatagi", type="primary", use_container_width=True)
 with col_btn2:
@@ -507,11 +571,12 @@ with col_btn2:
         st.session_state.results = []
         st.rerun()
 
-# Komunikat o trybie HTTP/2 (informacyjnie)
-if HTTP2_AVAILABLE:
-    st.caption("🔌 HTTP/2: włączony (wykryto pakiet `h2`).")
-else:
-    st.caption("🔌 HTTP/2: wyłączony (brak pakietu `h2`; działa HTTP/1.1).")
+# Info o trybie sieci
+net_bits = []
+net_bits.append("HTTP/2: TAK" if HTTP2_AVAILABLE else "HTTP/2: NIE")
+net_bits.append("curl_cffi: TAK" if CURLCFFI_AVAILABLE else "curl_cffi: NIE")
+net_bits.append("cloudscraper: TAK" if CLOUDSCRAPER_AVAILABLE else "cloudscraper: NIE")
+st.caption("🔌 " + " | ".join(net_bits))
 
 st.session_state.progress_placeholder = st.empty()
 
@@ -594,10 +659,10 @@ if results:
     else:
         displayed = results
 
-    table_rows: List[Dict[str, Any]] = []
+    rows: List[Dict[str, Any]] = []
     for r in displayed:
         if r.error:
-            table_rows.append({
+            rows.append({
                 "Status": "❌",
                 "SKU": r.sku or "-",
                 "ISBN": r.isbn or "-",
@@ -609,7 +674,7 @@ if results:
         else:
             t_status = "🟢" if r.meta_title_length <= MAX_TITLE else "🟡"
             d_status = "🟢" if r.meta_desc_length <= MAX_DESC else "🟡"
-            table_rows.append({
+            rows.append({
                 "Status": f"{t_status}{d_status}",
                 "SKU": r.sku or "-",
                 "ISBN": r.isbn or "-",
@@ -619,8 +684,8 @@ if results:
                 "Długość D": f"{r.meta_desc_length}/{MAX_DESC}",
             })
 
-    if table_rows:
-        df_display = pd.DataFrame(table_rows)
+    if rows:
+        df_display = pd.DataFrame(rows)
         st.dataframe(
             df_display,
             use_container_width=True,
@@ -645,4 +710,4 @@ if results:
 
 # ----------------------- STOPKA ------------------------------- #
 st.markdown("---")
-st.markdown("🔧 **Generator Metatagów SEO – wersja PRO** | JSON-LD, walidacja 2 zdań, anty-CTA, myślnik „-”, bez brandu | Powered by OpenAI GPT-5-nano")
+st.markdown("🔧 **Generator Metatagów SEO – wersja PRO** | Anti-403 (TLS/impersonate), JSON-LD, walidacja 2 zdań, anty-CTA, myślnik „-”, bez brandu | Powered by OpenAI GPT-5-nano")
