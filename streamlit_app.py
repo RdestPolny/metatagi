@@ -1,678 +1,449 @@
-# app.py
-# -*- coding: utf-8 -*-
-import asyncio
-import json
-import random
-import re
-import textwrap
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse
-
-import httpx
-import pandas as pd
 import streamlit as st
+import pandas as pd
+import requests
 from bs4 import BeautifulSoup as bs
-from bs4.element import Tag
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from openai import OpenAI
 
-# ----------------------- USTAWIENIA STRONY ----------------------- #
+# ------------- USTAWIENIA STRONY ------------- #
 st.set_page_config(page_title="Generator Metatagów SEO", page_icon="🏷️", layout="wide")
 
-# ----------------------- AUTO-WYKRYWANIE OPCJONALNYCH NARZĘDZI --- #
-try:
-    import h2  # noqa: F401
-    HTTP2_AVAILABLE = True
-except Exception:
-    HTTP2_AVAILABLE = False
-
-try:
-    from curl_cffi import requests as curlreq  # type: ignore
-    CURLCFFI_AVAILABLE = True
-except Exception:
-    CURLCFFI_AVAILABLE = False
-
-try:
-    import cloudscraper  # type: ignore
-    CLOUDSCRAPER_AVAILABLE = True
-except Exception:
-    CLOUDSCRAPER_AVAILABLE = False
-
-# ----------------------- STAŁE / SŁOWNIKI ------------------------ #
-CTA_WORDS = {
-    "kup", "kupisz", "kupuj", "kup teraz", "sprawdź", "zobacz", "zamów",
-    "kliknij", "odkryj", "poznaj", "przekonaj", "skorzystaj", "pobierz",
-    "dodaj do koszyka", "zamawiaj", "porównaj", "zarezerwuj"
-}
-
-ATTRIBUTE_KEYS = {
-    "materiał": ["materiał", "material", "surowiec"],
-    "wiek": ["wiek", "od lat", "wiek dziecka", "age range", "wiek rekomendowany"],
-    "format": ["format", "rozmiar", "wymiar", "wymiary", "size", "dimensions"],
-    "liczba stron": ["liczba stron", "stron", "pages"],
-    "oprawa": ["oprawa", "binding"],
-    "kolekcja": ["kolekcja", "linia", "seria"],
-    "kolor": ["kolor", "barwa", "color"],
-    "pojemność": ["pojemność", "capacity", "objętość"],
-    "typ": ["typ", "rodzaj", "type"],
-}
-
-BROWSER_UAS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-]
-SEC_CH = {
-    "sec-ch-ua": '"Chromium";v="126", "Not;A=Brand";v="99", "Google Chrome";v="126"',
-    "sec-ch-ua-mobile": "?0",
-    "sec-ch-ua-platform": '"Windows"',
-}
-
-LLM_MODEL = "gpt-5-nano"
-MAX_TITLE = 60
-MAX_DESC = 160
-
-# ----------------------- DANE / MODELE --------------------------- #
-@dataclass
-class ProductData:
-    url: str
-    sku: str = ""
-    title: str = ""
-    isbn: str = ""
-    category: str = ""
-    attributes: Dict[str, str] = None
-    description: str = ""
-    error: Optional[str] = None
-
-@dataclass
-class MetaResult:
-    url: str
-    sku: str
-    title: str
-    isbn: str
-    meta_title: str
-    meta_description: str
-    meta_title_length: int
-    meta_desc_length: int
-    error: Optional[str] = None
-
-# ----------------------- POMOCNICZE ------------------------------ #
-def to_host_brand(url: str) -> str:
-    try:
-        host = urlparse(url).hostname or ""
-        host = host.replace("www.", "")
-        base = host.split(".")[0]
-        return base.lower()
-    except Exception:
-        return ""
-
-def clean_text(s: str) -> str:
-    if not s:
-        return ""
-    s = s.replace("\xa0", " ")
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
-
-def trim_words(text: str, limit: int) -> str:
-    if len(text) <= limit:
-        return text
-    words, out = text.split(), []
-    for w in words:
-        if len((" ".join(out + [w])).strip()) > limit:
-            break
-        out.append(w)
-    out_text = " ".join(out).strip()
-    return out_text if out_text else text[: max(0, limit - 1)].rstrip() + "…"
-
-def normalize_title(title: str) -> str:
-    t = title.replace("—", "-").replace("…", "")
-    t = t.replace(".", "")
-    t = re.sub(r"\s*-\s*", " - ", t)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    return t
-
-def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
-    t = clean_text(desc)
-    for w in CTA_WORDS:
-        t = re.sub(rf"\b{re.escape(w)}\b", "", t, flags=re.I)
-    t = re.sub(r"\s{2,}", " ", t).strip()
-    parts = re.split(r"(?<=[\.\?\!])\s+", t) if t else []
-    parts = [p.strip() for p in parts if p.strip()]
-
-    def make_fact_from_attr(hint: str) -> str:
-        hint = clean_text(hint)[:120]
-        return hint or "Zawiera kluczowe cechy produktu"
-
-    if len(parts) == 0:
-        s1 = "Opis zawiera najważniejsze cechy produktu."
-        s2 = make_fact_from_attr(attrib_hint) + "."
-        t = f"{s1} {s2}"
-    elif len(parts) == 1:
-        s1 = parts[0] + ("" if re.search(r"[\.!\?]$", parts[0]) else ".")
-        s2 = make_fact_from_attr(attrib_hint) + "."
-        t = f"{s1} {s2}"
-    else:
-        s1, s2 = parts[0], parts[1]
-        if not re.search(r"[\.!\?]$", s1): s1 += "."
-        if not re.search(r"[\.!\?]$", s2): s2 += "."
-        t = f"{s1} {s2}"
-    return trim_words(t, MAX_DESC)
-
-def compress_attributes(attrs: Dict[str, str]) -> str:
-    if not attrs: return ""
-    pairs = []
-    for k, v in attrs.items():
-        k, v = clean_text(k), clean_text(v)
-        if k and v: pairs.append(f"{k}: {v}")
-    return "; ".join(pairs)
-
-# ----------------------- SCRAPING / PARSING ---------------------- #
-def map_attribute_label(label: str) -> Optional[str]:
-    label_lower = (label or "").strip().lower()
-    for canonical, variants in ATTRIBUTE_KEYS.items():
-        for v in variants:
-            if label_lower == v or label_lower.startswith(v):
-                return canonical
-    return None
-
-def extract_jsonld_product(soup: bs) -> Dict[str, Any]:
-    items: List[Dict[str, Any]] = []
-    for s in soup.find_all("script", type="application/ld+json"):
-        try:
-            data = json.loads(s.string or "")
-            if isinstance(data, dict): data = [data]
-            for d in data:
-                t = d.get("@type")
-                if isinstance(t, list):
-                    t = next((x for x in t if isinstance(x, str)), None)
-                if t in ("Product", "Book"):
-                    items.append(d)
-        except Exception:
-            continue
-    return items[0] if items else {}
-
-def extract_isbn(text: str) -> str:
-    if not text: return ""
-    m = re.search(r"\b97[89][- ]?\d{1,5}[- ]?\d{1,7}[- ]?\d{1,7}[- ]?\d\b", text)
-    return m.group(0).replace(" ", "").replace("-", "") if m else ""
-
-def parse_attributes_from_details(details_root: Tag) -> Dict[str, str]:
-    attrs: Dict[str, str] = {}
-    if not details_root: return attrs
-    for li in details_root.find_all("li"):
-        txt = clean_text(li.get_text(" ", strip=True))
-        if not txt: continue
-        if ":" in txt:
-            lab, val = txt.split(":", 1)
-        elif "–" in txt:
-            lab, val = txt.split("–", 1)
-        elif "-" in txt:
-            lab, val = txt.split("-", 1)
-        else:
-            continue
-        lab, val = clean_text(lab), clean_text(val)
-        key = map_attribute_label(lab)
-        if key and val: attrs.setdefault(key, val)
-    return attrs
-
-# -------------- FETCH: WIELOETAPOWE OMIJANIE PROSTYCH BLOKAD ----- #
-def base_headers(u: str) -> Dict[str, str]:
-    host = urlparse(u).hostname or ""
-    ua = random.choice(BROWSER_UAS)
-    return {
-        "User-Agent": ua,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Referer": f"https://{host}/",
-        **SEC_CH,
+# ------------- POBIERANIE DANYCH ------------- #
+def get_product_data(url):
+    """Scrapuje dane produktu ze strony."""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Accept-Language': 'pl-PL,pl;q=0.9,en-US;q=0.8,en;q=0.7',
     }
-
-async def fetch_via_httpx(url: str, max_retries: int = 3) -> str:
-    backoff = 0.8
-    for attempt in range(1, max_retries + 1):
-        headers = base_headers(url)
-        try:
-            async with httpx.AsyncClient(
-                headers=headers, follow_redirects=True, http2=HTTP2_AVAILABLE
-            ) as client:
-                r = await client.get(url, timeout=httpx.Timeout(25.0, connect=7.0))
-                if r.status_code == 403:
-                    raise httpx.HTTPStatusError("403 Forbidden", request=r.request, response=r)
-                r.raise_for_status()
-                return r.text
-        except Exception:
-            if attempt == max_retries:
-                raise
-            await asyncio.sleep(backoff + random.uniform(0, 0.6))
-            backoff *= 1.6
-    raise RuntimeError("Unreachable")
-
-def fetch_via_curlcffi(url: str) -> str:
-    resp = curlreq.get(
-        url,
-        headers=base_headers(url),
-        impersonate="chrome",
-        timeout=25,
-        allow_redirects=True,
-    )
-    if resp.status_code == 403:
-        raise RuntimeError("403 via curl_cffi")
-    resp.raise_for_status()
-    return resp.text
-
-def fetch_via_cloudscraper(url: str) -> str:
-    scraper = cloudscraper.create_scraper(browser={"browser": "chrome", "platform": "windows", "mobile": False})
-    r = scraper.get(url, headers=base_headers(url), timeout=25)
-    if r.status_code == 403:
-        raise RuntimeError("403 via cloudscraper")
-    r.raise_for_status()
-    return r.text
-
-async def robust_fetch_html(url: str) -> str:
     try:
-        return await fetch_via_httpx(url)
-    except Exception as e_httpx:
-        last = f"httpx fail: {e_httpx}"
-        if CURLCFFI_AVAILABLE:
-            try:
-                return await asyncio.to_thread(fetch_via_curlcffi, url)
-            except Exception as e_curl:
-                last += f" | curl_cffi fail: {e_curl}"
-        if CLOUDSCRAPER_AVAILABLE:
-            try:
-                return await asyncio.to_thread(fetch_via_cloudscraper, url)
-            except Exception as e_cloud:
-                last += f" | cloudscraper fail: {e_cloud}"
-        raise RuntimeError(last)
+        response = requests.get(url, headers=headers, timeout=30)
+        response.raise_for_status()
+        soup = bs(response.text, 'html.parser')
 
-# ----------------------- SCRAPER GŁÓWNY ------------------------- #
-async def scrape_product(url: str) -> ProductData:
-    try:
-        html = await robust_fetch_html(url)
+        title_tag = soup.find('h1')
+        title = title_tag.get_text(strip=True) if title_tag else ''
+
+        # Pobieranie ISBN z sekcji szczegółów
+        isbn = ""
+        details_div = soup.find("div", id="accordion-content__szczegóły")
+        if details_div:
+            ul = details_div.find("ul", class_="bullet")
+            if ul:
+                for li in ul.find_all("li", class_="display-detail"):
+                    li_text = li.get_text(strip=True)
+                    if li_text.startswith("ISBN:"):
+                        strong_tag = li.find("strong")
+                        if strong_tag:
+                            isbn = strong_tag.get_text(strip=True)
+                        break
+
+        details_text = ""
+        description_text = ""
+
+        # Logika scrapowania dla smyk.com
+        if 'smyk.com' in url:
+            smyk_desc_div = soup.find("div", attrs={"data-testid": "box-attributes__simple"})
+            if smyk_desc_div:
+                for p_tag in smyk_desc_div.find_all("p"):
+                    if p_tag.find("span", string=lambda x: x and "Nr produktu:" in x):
+                        p_tag.decompose()
+                description_text = smyk_desc_div.get_text(separator="\n", strip=True)
+
+            smyk_attributes_div = soup.find("div", class_="box-attributes__not-simple")
+            if smyk_attributes_div:
+                attributes_list = []
+                items = smyk_attributes_div.find_all("div", class_="box_attributes__spec-item")
+                for item in items:
+                    label_tag = item.find("span", class_="box-attributes-list__label--L")
+                    value_tag = item.find("span", class_="box-attributes-list__atribute--L")
+                    if label_tag and value_tag:
+                        label = label_tag.get_text(strip=True)
+                        value = value_tag.get_text(strip=True)
+                        if label and value:
+                            attributes_list.append(f"{label}: {value}")
+                
+                if attributes_list:
+                    details_text = "\n".join(attributes_list)
+        
+        # Uniwersalne scrapowanie dla innych stron
+        if not description_text:
+            details_div = soup.find("div", id="szczegoly") or soup.find("div", class_="product-features")
+            if details_div:
+                ul = details_div.find("ul", class_="bullet") or details_div.find("ul")
+                if ul:
+                    li_elements = ul.find_all("li")
+                    details_list = [li.get_text(separator=" ", strip=True) for li in li_elements]
+                    details_text = "\n".join(details_list)
+            
+            description_div = soup.find("div", class_="desc-container")
+            if description_div:
+                article = description_div.find("article")
+                if article:
+                    nested_article = article.find("article")
+                    if nested_article:
+                        description_text = nested_article.get_text(separator="\n", strip=True)
+                    else:
+                        description_text = article.get_text(separator="\n", strip=True)
+                else:
+                    description_text = description_div.get_text(separator="\n", strip=True)
+
+        if not description_text:
+            alt_desc_div = soup.find("div", id="product-description")
+            if alt_desc_div:
+                description_text = alt_desc_div.get_text(separator="\n", strip=True)
+
+        description_text = " ".join(description_text.split())
+
+        if not description_text and not details_text:
+            return {
+                'title': title,
+                'isbn': isbn,
+                'details': '',
+                'description': '',
+                'error': "Nie udało się pobrać danych produktu."
+            }
+        
+        return {
+            'title': title,
+            'isbn': isbn,
+            'details': details_text,
+            'description': description_text,
+            'error': None
+        }
     except Exception as e:
-        return ProductData(url=url, error=f"Błąd pobierania: {e}")
+        return {
+            'title': '',
+            'isbn': '',
+            'details': '',
+            'description': '',
+            'error': f"Błąd pobierania: {str(e)}"
+        }
 
+# ------------- GENEROWANIE METATAGÓW ------------- #
+def generate_meta_tags(product_data, client):
+    """Generuje meta title i meta description."""
     try:
-        soup = bs(html, "lxml")
-    except Exception:
-        soup = bs(html, "html.parser")
+        title = product_data.get('title', '')
+        details = product_data.get('details', '')
+        description = product_data.get('description', '')
+        
+        # >>>>>>>>>>>>>>>>>>>>>> NOWY, RYGORYSTYCZNY PROMPT <<<<<<<<<<<<<<<<<<<<<< #
+        system_prompt = """Jesteś ekspertem SEO tworzącym metatagi e-commerce po polsku.
 
-    title_tag = soup.find("h1") or soup.find("h1", attrs={"itemprop": "name"})
-    title = clean_text(title_tag.get_text(strip=True)) if title_tag else ""
+WYMAGANIA META TITLE:
+- Maksymalnie 60 znaków (włącznie ze spacjami)
+- Zacznij od najważniejszego słowa kluczowego (nazwa typu produktu/kategoria)
+- Dodaj 1–2 kluczowe cechy/parametry (np. materiał, liczba stron, wiek, format)
+- Używaj TYLKO zwykłego myślnika "-" (nie używaj długiego "—")
+- BEZ kropek w meta title
+- BEZ nazw sklepów/brandów, BEZ CTA, BEZ emoji
 
-    ld = extract_jsonld_product(soup)
-    ld_name = clean_text(ld.get("name", "")) if ld else ""
-    ld_desc = clean_text(ld.get("description", "")) if ld else ""
-    ld_category = clean_text(ld.get("category", "")) if ld else ""
-    ld_isbn = clean_text(ld.get("isbn", "")) if ld else ""
-    if not ld_isbn:
-        try:
-            ap = ld.get("additionalProperty") or []
-            if isinstance(ap, dict): ap = [ap]
-            for p in ap:
-                if str(p.get("name", "")).lower() == "isbn":
-                    ld_isbn = clean_text(p.get("value", ""))
-                    break
-        except Exception:
-            pass
+WYMAGANIA META DESCRIPTION:
+- Maksymalnie 160 znaków (włącznie ze spacjami)
+- Dokładnie DWA krótkie zdania informacyjne
+- Wyłącznie neutralne fakty o produkcie; naturalne słowa kluczowe
+- BEZ CTA i BEZ nazw sklepów/brandów
+- Możesz użyć obiektywnych parametrów (np. ISBN, materiał, liczba stron), tylko jeśli się mieszczą
 
-    description_text = ""
-    for tag, attrs in [
-        ("div", {"class": "desc-container"}),
-        ("div", {"id": "product-description"}),
-        ("div", {"itemprop": "description"}),
-        ("section", {"id": "description"}),
-        ("div", {"class": "product-description"}),
-        ("article", {}),
-    ]:
-        node = soup.find(tag, attrs=attrs)
-        if node:
-            art = node.find("article") or node
-            description_text = clean_text(art.get_text(separator="\n", strip=True))
-            if description_text:
-                break
+ZASADY DODATKOWE:
+- Jeśli brakuje danych, NIE halucynuj – bazuj wyłącznie na przekazanym tytule/opisie/atrybutach
+- Przed odpowiedzią mentalnie zweryfikuj limity długości i to, że opis ma dokładnie dwa zdania
 
-    if "smyk.com" in url and not description_text:
-        smyk_desc_div = soup.find("div", attrs={"data-testid": "box-attributes__simple"})
-        if smyk_desc_div:
-            for p_tag in smyk_desc_div.find_all("p"):
-                if p_tag.find("span", string=lambda x: x and "Nr produktu:" in x):
-                    p_tag.decompose()
-            description_text = clean_text(smyk_desc_div.get_text(separator="\n", strip=True))
+FORMAT ODPOWIEDZI (dokładnie dwie linie):
+Meta title: [treść]
+Meta description: [treść]
+Zwróć wyłącznie te dwie linie w tej kolejności."""
 
-    details_root = (
-        soup.find("div", id="szczegoly")
-        or soup.find("div", class_="product-features")
-        or soup.find("ul", class_="bullet")
-        or soup.find("div", class_="box-attributes__not-simple")
-    )
-    attributes = parse_attributes_from_details(details_root) if details_root else {}
+        user_prompt = f"""DANE PRODUKTU:
+Tytuł: {title if title else 'brak'}
+Szczegóły (wybrane atrybuty, lista): {details[:600] if details else 'brak'}
+Opis: {description[:900] if description else 'brak'}
 
-    isbn = ld_isbn or extract_isbn(ld_desc or description_text or html)
+Na podstawie powyższych danych stwórz zoptymalizowane metatagi zgodnie z wymaganiami i formatem odpowiedzi."""
+        # >>>>>>>>>>>>>>>>>>>>>> KONIEC ZMIAN W PROMPCIE <<<<<<<<<<<<<<<<<<<<<< #
 
-    category = ld_category
-    if not category:
-        bc = soup.find("nav", {"aria-label": re.compile("breadcrumb", re.I)}) or soup.find("ul", class_="breadcrumbs")
-        if bc:
-            cat = clean_text(bc.get_text(" > ", strip=True))
-            category = cat.split(">")[-1].strip() if ">" in cat else cat
+        full_input = f"{system_prompt}\n\n{user_prompt}"
 
-    if ld_name and len(ld_name) > 4:
-        title = ld_name
-    description = ld_desc if len(ld_desc) > 30 else description_text
-
-    return ProductData(
-        url=url,
-        title=title,
-        isbn=isbn,
-        category=category,
-        attributes=attributes,
-        description=description,
-        error=None,
-    )
-
-# ----------------------- LLM / PROMPT ---------------------------- #
-def build_system_prompt() -> str:
-    return textwrap.dedent("""
-    Jesteś ekspertem SEO. Tworzysz metatagi e-commerce po polsku.
-
-    WYMAGANIA META TITLE:
-    - ≤ 60 znaków (spacje wliczone)
-    - 1 fraza kluczowa na start + 1–2 cechy produktu
-    - Zwykły myślnik "-" wyłącznie, bez kropek i brandu/sklepu
-    - Bez CTA
-
-    WYMAGANIA META DESCRIPTION:
-    - ≤ 160 znaków
-    - Dokładnie 2 krótkie zdania, wyłącznie informacyjne
-    - Bez CTA i bez nazwy sklepu/brandu
-    - Naturalne słowa kluczowe
-
-    ZWRÓĆ WYŁĄCZNIE JSON:
-    {"meta_title":"...","meta_description":"..."}
-    """).strip()
-
-def build_user_prompt(pd: ProductData, brand_block: str) -> str:
-    attrs_str = compress_attributes(pd.attributes or {})
-    desc_snippet = clean_text(pd.description)[:800]
-    return textwrap.dedent(f"""
-    DANE PRODUKTU (oczyszczone):
-    Tytuł: {pd.title or "brak"}
-    Kategoria: {pd.category or "brak"}
-    Atrybuty kluczowe: {attrs_str or "brak"}
-    ISBN: {pd.isbn or "brak"}
-    Opis (skrót): {desc_snippet or "brak"}
-
-    Nazwy zakazane (nie mogą się pojawić): {brand_block or "brak"}
-    Stwórz metatagi wg wymagań.
-    """).strip()
-
-def postprocess_llm_output(meta_title: str, meta_description: str, banned_words: List[str]) -> Tuple[str, str]:
-    meta_title = normalize_title(meta_title)
-    for w in banned_words:
-        if not w: continue
-        meta_title = re.sub(rf"\b{re.escape(w)}\b", "", meta_title, flags=re.I)
-        meta_description = re.sub(rf"\b{re.escape(w)}\b", "", meta_description, flags=re.I)
-    meta_description = ensure_two_sentences(meta_description, "")
-    meta_title = trim_words(meta_title, MAX_TITLE)
-    meta_description = trim_words(meta_description, MAX_DESC)
-    meta_title = re.sub(r"\s{2,}", " ", meta_title).strip(" -")
-    meta_description = re.sub(r"\s{2,}", " ", meta_description).strip()
-    return meta_title, meta_description
-
-async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: asyncio.Semaphore) -> MetaResult:
-    if pd.error:
-        return MetaResult(
-            url=pd.url, sku="", title=pd.title, isbn=pd.isbn,
-            meta_title="", meta_description="", meta_title_length=0, meta_desc_length=0,
-            error=pd.error
+        response = client.responses.create(
+            model="gpt-5-nano",
+            input=full_input,
+            reasoning={"effort": "medium"},
+            text={"verbosity": "low"}
         )
-    system_prompt = build_system_prompt()
-    brand = to_host_brand(pd.url)
-    user_prompt = build_user_prompt(pd, brand)
-
-    try:
-        async with semaphore:
-            # Używamy Chat Completions API (kompatybilne z response_format)
-            def call_openai():
-                resp = client.chat.completions.create(
-                    model=LLM_MODEL,
-                    messages=[
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt},
-                    ],
-                    response_format={"type": "json_object"},  # <- kluczowa różnica
-                    temperature=0.2,
-                )
-                return resp
-            resp = await asyncio.to_thread(call_openai)
-
-        content = resp.choices[0].message.content if resp and resp.choices else ""
-        if not content:
-            raise ValueError("Pusta odpowiedź modelu.")
-
-        try:
-            data = json.loads(content)
-        except Exception:
-            m = re.search(r"\{.*\}", content, flags=re.S)
-            data = json.loads(m.group(0)) if m else {}
-
-        mt = clean_text(data.get("meta_title", ""))
-        md = clean_text(data.get("meta_description", ""))
-
-        banned = [brand]
-        mt, md = postprocess_llm_output(mt, md, banned)
-
-        return MetaResult(
-            url=pd.url, sku=pd.sku or "", title=pd.title or "", isbn=pd.isbn or "",
-            meta_title=mt, meta_description=md,
-            meta_title_length=len(mt), meta_desc_length=len(md),
-            error=None
-        )
+        
+        result = response.output_text
+        meta_title = ""
+        meta_description = ""
+        
+        for line in result.splitlines():
+            line = line.strip()
+            if line.lower().startswith("meta title:"):
+                meta_title = line[len("meta title:"):].strip()
+            elif line.lower().startswith("meta description:"):
+                meta_description = line[len("meta description:"):].strip()
+        
+        # Zamiana długiego myślnika na zwykły
+        meta_title = meta_title.replace('—', '-')
+        
+        # Usuwanie kropek z meta title
+        meta_title = meta_title.replace('.', '')
+        
+        # Walidacja długości (zachowana jak w oryginale)
+        if len(meta_title) > 60:
+            meta_title = meta_title[:57] + "..."
+        if len(meta_description) > 160:
+            meta_description = meta_description[:157] + "..."
+        
+        return meta_title, meta_description
     except Exception as e:
-        return MetaResult(
-            url=pd.url, sku=pd.sku or "", title=pd.title or "", isbn=pd.isbn or "",
-            meta_title="", meta_description="", meta_title_length=0, meta_desc_length=0,
-            error=f"Błąd LLM: {e}"
-        )
+        return f"BŁĄD: {str(e)}", f"BŁĄD: {str(e)}"
 
-# ----------------------- PIPELINE ------------------------------- #
-async def run_pipeline(urls: List[str], skus: List[str], llm_client: OpenAI) -> List[MetaResult]:
-    scrape_tasks = [scrape_product(u) for u in urls]
-    scraped: List[ProductData] = await asyncio.gather(*scrape_tasks)
+# ------------- PRZETWARZANIE RÓWNOLEGŁE ------------- #
+def process_single_product(url, sku, client):
+    """Przetwarza jeden produkt: scrapuje dane i generuje metatagi."""
+    try:
+        product_data = get_product_data(url)
+        
+        if product_data['error']:
+            return {
+                'url': url,
+                'sku': sku,
+                'title': product_data.get('title', ''),
+                'isbn': product_data.get('isbn', ''),
+                'meta_title': '',
+                'meta_description': '',
+                'error': product_data['error']
+            }
+        
+        meta_title, meta_description = generate_meta_tags(product_data, client)
+        
+        if "BŁĄD:" in meta_title:
+            return {
+                'url': url,
+                'sku': sku,
+                'title': product_data.get('title', ''),
+                'isbn': product_data.get('isbn', ''),
+                'meta_title': '',
+                'meta_description': '',
+                'error': meta_title
+            }
+        
+        return {
+            'url': url,
+            'sku': sku,
+            'title': product_data.get('title', ''),
+            'isbn': product_data.get('isbn', ''),
+            'meta_title': meta_title,
+            'meta_description': meta_description,
+            'meta_title_length': len(meta_title),
+            'meta_desc_length': len(meta_description),
+            'error': None
+        }
+    except Exception as e:
+        return {
+            'url': url,
+            'sku': sku,
+            'title': '',
+            'isbn': '',
+            'meta_title': '',
+            'meta_description': '',
+            'error': f"Nieoczekiwany błąd: {str(e)}"
+        }
 
-    for i, pd_obj in enumerate(scraped):
-        pd_obj.sku = skus[i] if i < len(skus) else ""
-
-    sem = asyncio.Semaphore(3)
-    gen_tasks = [generate_for_product(llm_client, pd_obj, sem) for pd_obj in scraped]
-    results: List[MetaResult] = []
-    completed = 0
-    total = len(gen_tasks)
-
-    for coro in asyncio.as_completed(gen_tasks):
-        r = await coro
-        results.append(r)
-        completed += 1
-        st.session_state.progress_placeholder.progress(
-            completed / total,
-            text=f"Generowanie metatagów: {completed}/{total}"
-        )
-
-    idx_map = {u: i for i, u in enumerate(urls)}
-    results_sorted = sorted(results, key=lambda x: idx_map.get(x.url, 10**9))
-    return results_sorted
-
-# ----------------------- UI ------------------------------------ #
-st.title("🏷️ Generator Metatagów SEO – Tryb Wsadowy (wersja PRO)")
-st.markdown("Wygeneruj **meta title** i **meta description** na bazie danych konkurencji – stabilny JSON, walidacja i semantyka.")
-
-st.sidebar.header("📊 Limity SEO")
-st.sidebar.metric("Meta Title", f"max {MAX_TITLE} znaków")
-st.sidebar.metric("Meta Description", f"max {MAX_DESC} znaków")
-st.sidebar.markdown("---")
-st.sidebar.subheader("✅ Standardy SEO")
-st.sidebar.markdown("""
-- **Meta Title:** zwykły myślnik "-", brak kropek i brandu
-- **Meta Description:** dokładnie 2 zdania, bez CTA, obiektywne fakty
-- Naturalne słowa kluczowe, skupienie na produkcie
-""")
-
-st.info("📝 Wklej linki do produktów i (opcjonalnie) kody SKU – jeden na linię.")
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    urls_input = st.text_area(
-        "🔗 Linki do produktów (jeden na linię)",
-        height=260,
-        placeholder="https://example.com/produkt-1\nhttps://example.com/produkt-2",
-        key="urls",
-    )
-with col2:
-    skus_input = st.text_area(
-        "🏷️ Kody SKU (opcjonalne, jeden na linię)",
-        height=260,
-        placeholder="SKU-001\nSKU-002",
-        key="skus",
-        help="Opcjonalne. Dopasowywane w kolejności do linków.",
-    )
+# ------------- INICJALIZACJA ------------- #
+if 'results' not in st.session_state:
+    st.session_state.results = []
 
 if "OPENAI_API_KEY" not in st.secrets:
-    st.error("❌ Brak klucza API OpenAI w secrets. Skonfiguruj `OPENAI_API_KEY`.")
+    st.error("❌ Brak klucza API OpenAI w secrets. Skonfiguruj OPENAI_API_KEY.")
     st.stop()
-
-if "results" not in st.session_state:
-    st.session_state.results: List[MetaResult] = []
 
 client = OpenAI()
 
+# ------------- INTERFEJS UŻYTKOWNIKA ------------- #
+st.title('🏷️ Generator Metatagów SEO - Tryb Wsadowy')
+st.markdown("Wygeneruj zoptymalizowane meta title i meta description dla wielu produktów jednocześnie.")
+
+# Sidebar z informacjami
+st.sidebar.header("📊 Limity SEO")
+st.sidebar.metric("Meta Title", "max 60 znaków")
+st.sidebar.metric("Meta Description", "max 160 znaków")
+st.sidebar.markdown("---")
+st.sidebar.info("💡 **Wskazówka:** Zielony status 🟢 oznacza poprawną długość, żółty 🟡 przekroczenie limitu.")
+st.sidebar.markdown("---")
+st.sidebar.subheader("✅ Standardy SEO")
+st.sidebar.markdown("""
+- **Meta Title:** Tylko zwykły myślnik "-"
+- **Meta Title:** Bez nazwy sklepu/brandu
+- **Meta Description:** 2 zdania informacyjne
+- **Meta Description:** Bez CTA
+- Skupienie na produkcie i jego wartości
+""")
+
+# Główna zawartość
+st.info("📝 Wklej linki do produktów i wygeneruj dla nich zoptymalizowane metatagi SEO.")
+
+col1, col2 = st.columns([2, 1])
+
+with col1:
+    urls_input = st.text_area(
+        "🔗 Linki do produktów (jeden na linię)",
+        height=300,
+        placeholder="https://example.com/produkt-1\nhttps://example.com/produkt-2\nhttps://example.com/produkt-3",
+        key="urls"
+    )
+
+with col2:
+    skus_input = st.text_area(
+        "🏷️ Kody SKU (opcjonalne, jeden na linię)",
+        height=300,
+        placeholder="SKU-001\nSKU-002\nSKU-003",
+        key="skus",
+        help="Opcjonalne pole identyfikacyjne produktu"
+    )
+
 col_btn1, col_btn2 = st.columns([3, 1])
+
 with col_btn1:
-    gen_clicked = st.button("🚀 Generuj metatagi", type="primary", use_container_width=True)
+    if st.button("🚀 Generuj metatagi", type="primary", use_container_width=True):
+        urls = [url.strip() for url in urls_input.splitlines() if url.strip()]
+        skus = [sku.strip() for sku in skus_input.splitlines() if sku.strip()]
+        
+        if not urls:
+            st.error("❌ Podaj przynajmniej jeden link do produktu!")
+        else:
+            # Jeśli SKU nie podano, uzupełnij pustymi stringami
+            if len(skus) < len(urls):
+                skus.extend([''] * (len(urls) - len(skus)))
+            elif len(skus) > len(urls):
+                st.warning(f"⚠️ Liczba SKU ({len(skus)}) jest większa niż linków ({len(urls)}). Ignoruję nadmiarowe SKU.")
+                skus = skus[:len(urls)]
+            
+            st.session_state.results = []
+            
+            progress_bar = st.progress(0, text="Rozpoczynam generowanie metatagów...")
+            
+            with ThreadPoolExecutor(max_workers=5) as executor:
+                future_to_data = {
+                    executor.submit(process_single_product, url, sku, client): (url, sku)
+                    for url, sku in zip(urls, skus)
+                }
+                
+                results_temp = []
+                for i, future in enumerate(as_completed(future_to_data)):
+                    result = future.result()
+                    results_temp.append(result)
+                    progress_bar.progress(
+                        (i + 1) / len(future_to_data),
+                        text=f"Przetworzono {i+1}/{len(future_to_data)}"
+                    )
+            
+            # Sortuj według kolejności oryginalnych URL-i
+            st.session_state.results = sorted(results_temp, key=lambda x: urls.index(x['url']))
+            progress_bar.progress(1.0, text="✅ Zakończono!")
+            st.success(f"Wygenerowano metatagi dla {len(st.session_state.results)} produktów!")
+
 with col_btn2:
     if st.button("🗑️ Wyczyść", use_container_width=True):
         st.session_state.results = []
         st.rerun()
 
-# Informacja o trybie sieci
-net_bits = []
-net_bits.append("HTTP/2: TAK" if HTTP2_AVAILABLE else "HTTP/2: NIE")
-net_bits.append("curl_cffi: TAK" if CURLCFFI_AVAILABLE else "curl_cffi: NIE")
-net_bits.append("cloudscraper: TAK" if CLOUDSCRAPER_AVAILABLE else "cloudscraper: NIE")
-st.caption("🔌 " + " | ".join(net_bits))
-
-st.session_state.progress_placeholder = st.empty()
-
-if gen_clicked:
-    urls = [u.strip() for u in urls_input.splitlines() if u.strip()]
-    skus = [s.strip() for s in skus_input.splitlines() if s.strip()]
-
-    if not urls:
-        st.error("❌ Podaj przynajmniej jeden link do produktu!")
-    else:
-        if len(skus) < len(urls):
-            skus.extend([""] * (len(urls) - len(skus)))
-        elif len(skus) > len(urls):
-            st.warning(f"⚠️ SKU ({len(skus)}) > linków ({len(urls)}). Nadmiarowe SKU zostaną zignorowane.")
-            skus = skus[: len(urls)]
-
-        st.session_state.progress_placeholder.progress(0.0, text="Scraping danych produktów...")
-        try:
-            results = asyncio.run(run_pipeline(urls, skus, client))
-            st.session_state.results = results
-            st.session_state.progress_placeholder.progress(1.0, text="✅ Zakończono generowanie!")
-            st.success(f"Wygenerowano metatagi dla {len(results)} produktów.")
-        except Exception as e:
-            st.error(f"❌ Błąd przetwarzania: {e}")
-
-# ----------------------- WYNIKI / STATYSTYKI -------------------- #
-results = st.session_state.results
-if results:
+# Wyświetlanie wyników
+if st.session_state.results:
     st.markdown("---")
     st.header("📊 Wyniki")
-
-    successful = [r for r in results if not r.error]
-    errors = [r for r in results if r.error]
-
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("🔗 Wszystkie", len(results))
-    c2.metric("✅ Sukces", len(successful))
-    c3.metric("❌ Błędy", len(errors))
+    
+    results = st.session_state.results
+    successful = [r for r in results if r['error'] is None]
+    errors = [r for r in results if r['error'] is not None]
+    
+    # Statystyki
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("🔗 Wszystkie", len(results))
+    col2.metric("✅ Sukces", len(successful))
+    col3.metric("❌ Błędy", len(errors))
+    
     if successful:
-        avg_title = sum(r.meta_title_length for r in successful) / len(successful)
-        avg_desc = sum(r.meta_desc_length for r in successful) / len(successful)
-        c4.metric("📏 Śr. długość title", f"{avg_title:.0f} zn.")
-
+        avg_title_len = sum(r['meta_title_length'] for r in successful) / len(successful)
+        avg_desc_len = sum(r['meta_desc_length'] for r in successful) / len(successful)
+        col4.metric("📏 Śr. długość title", f"{avg_title_len:.0f} zn.")
+    
+    # Eksport do CSV
     if successful:
         df = pd.DataFrame([
             {
-                "URL": r.url,
-                "SKU": r.sku,
-                "ISBN": r.isbn,
-                "Tytuł produktu": r.title,
-                "Meta Title": r.meta_title,
-                "Meta Description": r.meta_description,
-                "Długość Title": r.meta_title_length,
-                "Długość Description": r.meta_desc_length,
+                'URL': r['url'],
+                'SKU': r['sku'],
+                'ISBN': r['isbn'],
+                'Tytuł produktu': r['title'],
+                'Meta Title': r['meta_title'],
+                'Meta Description': r['meta_description'],
+                'Długość Title': r['meta_title_length'],
+                'Długość Description': r['meta_desc_length']
             }
             for r in successful
         ])
-        csv = df.to_csv(index=False).encode("utf-8")
+        
+        csv = df.to_csv(index=False).encode('utf-8')
         st.download_button(
-            "📥 Pobierz wyniki CSV",
-            data=csv,
-            file_name="metatagi_seo.csv",
-            mime="text/csv",
-            use_container_width=True,
+            "📥 Pobierz wyniki jako CSV",
+            csv,
+            "metatagi_seo.csv",
+            "text/csv",
+            use_container_width=True
         )
-
+    
+    # Szczegółowe wyniki - TABELA
     st.markdown("---")
-    st.subheader("📋 Tabela wyników")
-
+    st.subheader("📋 Wyniki w formie tabeli")
+    
+    # Filtrowanie
     show_filter = st.radio(
         "Pokaż:",
         ["Wszystkie", "Tylko sukces", "Tylko błędy"],
-        horizontal=True,
+        horizontal=True
     )
-
+    
     if show_filter == "Tylko sukces":
-        displayed = successful
+        displayed_results = successful
     elif show_filter == "Tylko błędy":
-        displayed = errors
+        displayed_results = errors
     else:
-        displayed = results
-
-    rows: List[Dict[str, Any]] = []
-    for r in displayed:
-        if r.error:
-            rows.append({
-                "Status": "❌",
-                "SKU": r.sku or "-",
-                "ISBN": r.isbn or "-",
-                "Meta Title": f"BŁĄD: {r.error[:80]}...",
-                "Meta Description": "-",
-                "Długość T": "-",
-                "Długość D": "-",
-            })
-        else:
-            t_status = "🟢" if r.meta_title_length <= MAX_TITLE else "🟡"
-            d_status = "🟢" if r.meta_desc_length <= MAX_DESC else "🟡"
-            rows.append({
-                "Status": f"{t_status}{d_status}",
-                "SKU": r.sku or "-",
-                "ISBN": r.isbn or "-",
-                "Meta Title": r.meta_title,
-                "Meta Description": r.meta_description,
-                "Długość T": f"{r.meta_title_length}/{MAX_TITLE}",
-                "Długość D": f"{r.meta_desc_length}/{MAX_DESC}",
-            })
-
-    if rows:
-        df_display = pd.DataFrame(rows)
+        displayed_results = results
+    
+    # Tworzenie tabeli dla wszystkich wyników
+    if displayed_results:
+        table_data = []
+        for result in displayed_results:
+            if result['error']:
+                # Wiersz z błędem
+                table_data.append({
+                    'Status': '❌',
+                    'SKU': result['sku'] if result['sku'] else '-',
+                    'ISBN': result['isbn'] if result['isbn'] else '-',
+                    'Meta Title': f"BŁĄD: {result['error'][:50]}...",
+                    'Meta Description': '-',
+                    'Długość T': '-',
+                    'Długość D': '-'
+                })
+            else:
+                # Wiersz z sukcesem
+                title_status = '🟢' if result['meta_title_length'] <= 60 else '🟡'
+                desc_status = '🟢' if result['meta_desc_length'] <= 160 else '🟡'
+                
+                table_data.append({
+                    'Status': f"{title_status}{desc_status}",
+                    'SKU': result['sku'] if result['sku'] else '-',
+                    'ISBN': result['isbn'] if result['isbn'] else '-',
+                    'Meta Title': result['meta_title'],
+                    'Meta Description': result['meta_description'],
+                    'Długość T': f"{result['meta_title_length']}/60",
+                    'Długość D': f"{result['meta_desc_length']}/160"
+                })
+        
+        df_display = pd.DataFrame(table_data)
+        
+        # Konfiguracja wyświetlania kolumn
         st.dataframe(
             df_display,
             use_container_width=True,
@@ -685,16 +456,9 @@ if results:
                 "Meta Description": st.column_config.TextColumn("Meta Description", width="large"),
                 "Długość T": st.column_config.TextColumn("Dł. T", width="small"),
                 "Długość D": st.column_config.TextColumn("Dł. D", width="small"),
-            },
+            }
         )
 
-    with st.expander("🛠️ Diagnostyka (dla ciekawych)"):
-        st.write("Poniżej surowe dane wejściowe po scrapingu (pierwsze 3 pozycje):")
-        diag = []
-        for r in results[:3]:
-            diag.append(asdict(r))
-        st.json(diag)
-
-# ----------------------- STOPKA ------------------------------- #
+# Stopka
 st.markdown("---")
-st.markdown("🔧 **Generator Metatagów SEO – wersja PRO** | Anti-403, JSON-LD, walidacja 2 zdań, anty-CTA, myślnik „-”, bez brandu | Powered by OpenAI GPT-5-nano")
+st.markdown("🔧 **Generator Metatagów SEO** | Powered by OpenAI GPT-5-nano")
