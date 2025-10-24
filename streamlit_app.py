@@ -19,6 +19,13 @@ from openai import OpenAI
 # ----------------------- USTAWIENIA STRONY ----------------------- #
 st.set_page_config(page_title="Generator Metatagów SEO", page_icon="🏷️", layout="wide")
 
+# ----------------------- AUTO-WYKRYWANIE HTTP/2 ------------------ #
+try:
+    import h2  # noqa: F401
+    HTTP2_AVAILABLE = True
+except Exception:
+    HTTP2_AVAILABLE = False
+
 # ----------------------- STAŁE / SŁOWNIKI ------------------------ #
 CTA_WORDS = {
     "kup", "kupisz", "kupuj", "kup teraz", "sprawdź", "zobacz", "zamów",
@@ -94,7 +101,6 @@ def trim_words(text: str, limit: int) -> str:
             break
         out.append(w)
     out_text = " ".join(out).strip()
-    # fallback jeśli pierwsze słowo jest dłuższe niż limit
     return out_text if out_text else text[: max(0, limit - 1)].rstrip() + "…"
 
 def normalize_title(title: str) -> str:
@@ -113,15 +119,12 @@ def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
         t = re.sub(rf"\b{re.escape(w)}\b", "", t, flags=re.I)
     t = re.sub(r"\s{2,}", " ", t).strip()
 
-    # policz zdania po . ? !
     parts = re.split(r"(?<=[\.\?\!])\s+", t) if t else []
     parts = [p.strip() for p in parts if p.strip()]
 
     def make_fact_from_attr(hint: str) -> str:
         hint = clean_text(hint)
-        # skróć, bez kropek na końcu – dodamy kropkę niżej
         hint = hint[:120]
-        # heurystyka – bez czasowników marketingowych
         return hint or "Zawiera kluczowe cechy produktu"
 
     if len(parts) == 0:
@@ -130,13 +133,11 @@ def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
         t = f"{s1} {s2}"
     elif len(parts) == 1:
         s2 = make_fact_from_attr(attrib_hint) + "."
-        # dopilnuj, by pierwsze zdanie kończyło się kropką
         s1 = parts[0]
         if not re.search(r"[\.!\?]$", s1):
             s1 += "."
         t = f"{s1} {s2}"
     else:
-        # bierz pierwsze dwa zdania
         s1, s2 = parts[0], parts[1]
         if not re.search(r"[\.!\?]$", s1):
             s1 += "."
@@ -144,7 +145,6 @@ def ensure_two_sentences(desc: str, attrib_hint: str = "") -> str:
             s2 += "."
         t = f"{s1} {s2}"
 
-    # przytnij po słowach
     return trim_words(t, MAX_DESC)
 
 def compress_attributes(attrs: Dict[str, str]) -> str:
@@ -172,7 +172,6 @@ def extract_jsonld_product(soup: bs) -> Dict[str, Any]:
     for s in soup.find_all("script", type="application/ld+json"):
         try:
             data = json.loads(s.string or "")
-            # JSON-LD potrafi być listą lub dict’em
             if isinstance(data, dict):
                 data = [data]
             for d in data:
@@ -195,13 +194,10 @@ def parse_attributes_from_details(details_root: Tag) -> Dict[str, str]:
     attrs: Dict[str, str] = {}
     if not details_root:
         return attrs
-
-    # bullet list
     for li in details_root.find_all("li"):
         txt = clean_text(li.get_text(" ", strip=True))
         if not txt:
             continue
-        # split po ":" lub " – "
         if ":" in txt:
             lab, val = txt.split(":", 1)
         elif "–" in txt:
@@ -215,7 +211,6 @@ def parse_attributes_from_details(details_root: Tag) -> Dict[str, str]:
         key = map_attribute_label(lab)
         if key and val:
             attrs.setdefault(key, val)
-
     return attrs
 
 async def fetch_html(client: httpx.AsyncClient, url: str) -> str:
@@ -230,7 +225,8 @@ async def scrape_product(url: str) -> ProductData:
         "Accept-Encoding": "gzip, deflate, br",
     }
     try:
-        async with httpx.AsyncClient(headers=headers, follow_redirects=True, http2=True) as client:
+        # AUTO: http2=HTTP2_AVAILABLE – brak h2 => przełącza na HTTP/1.1
+        async with httpx.AsyncClient(headers=headers, follow_redirects=True, http2=HTTP2_AVAILABLE) as client:
             html = await fetch_html(client, url)
     except Exception as e:
         return ProductData(url=url, error=f"Błąd pobierania: {e}")
@@ -251,7 +247,6 @@ async def scrape_product(url: str) -> ProductData:
     ld_category = clean_text(ld.get("category", "")) if ld else ""
     ld_isbn = clean_text(ld.get("isbn", "")) if ld else ""
     if not ld_isbn:
-        # czasem ISBN siedzi jako additionalProperty
         try:
             ap = ld.get("additionalProperty") or []
             if isinstance(ap, dict):
@@ -263,7 +258,7 @@ async def scrape_product(url: str) -> ProductData:
         except Exception:
             pass
 
-    # Opis (fallback, jeśli LD nie wystarczy)
+    # Opis
     description_text = ""
     desc_candidates = [
         ("div", {"class": "desc-container"}),
@@ -276,13 +271,12 @@ async def scrape_product(url: str) -> ProductData:
     for tag, attrs in desc_candidates:
         node = soup.find(tag, attrs=attrs)
         if node:
-            # czasem gniazduje <article>
             art = node.find("article") or node
             description_text = clean_text(art.get_text(separator="\n", strip=True))
             if description_text:
                 break
 
-    # Smyk – specyficzne miejsce
+    # Smyk spec
     if "smyk.com" in url and not description_text:
         smyk_desc_div = soup.find("div", attrs={"data-testid": "box-attributes__simple"})
         if smyk_desc_div:
@@ -300,23 +294,20 @@ async def scrape_product(url: str) -> ProductData:
     )
     attributes = parse_attributes_from_details(details_root) if details_root else {}
 
-    # ISBN – jeszcze raz spróbuj z całego HTML
+    # ISBN
     isbn = ld_isbn or extract_isbn(ld_desc or description_text or html)
 
     # Kategoria
     category = ld_category
     if not category:
-        # heurystyka: breadcrumbs
         bc = soup.find("nav", {"aria-label": re.compile("breadcrumb", re.I)}) or soup.find("ul", class_="breadcrumbs")
         if bc:
             cat = clean_text(bc.get_text(" > ", strip=True))
             category = cat.split(">")[-1].strip() if ">" in cat else cat
 
-    # Tytuł – preferuj LD name, jeśli sensowny
+    # Tytuł/Opis – preferuj JSON-LD
     if ld_name and len(ld_name) > 4:
         title = ld_name
-
-    # Opis – preferuj LD description
     description = ld_desc if len(ld_desc) > 30 else description_text
 
     return ProductData(
@@ -353,7 +344,6 @@ def build_system_prompt() -> str:
 def build_user_prompt(pd: ProductData, brand_block: str) -> str:
     attrs_str = compress_attributes(pd.attributes or {})
     desc_snippet = clean_text(pd.description)[:800]
-    # brand_block – nazwa hosta domeny ze śladu konkurencji, aby model nie używał jej w metatagach
     return textwrap.dedent(f"""
     DANE PRODUKTU (oczyszczone):
     Tytuł: {pd.title or "brak"}
@@ -367,23 +357,15 @@ def build_user_prompt(pd: ProductData, brand_block: str) -> str:
     """).strip()
 
 def postprocess_llm_output(meta_title: str, meta_description: str, banned_words: List[str]) -> Tuple[str, str]:
-    # Normalize title
     meta_title = normalize_title(meta_title)
-    # usuń zakazane słowa (brand/sklep)
     for w in banned_words:
         if not w:
             continue
         meta_title = re.sub(rf"\b{re.escape(w)}\b", "", meta_title, flags=re.I)
         meta_description = re.sub(rf"\b{re.escape(w)}\b", "", meta_description, flags=re.I)
-    # usuń CTA z opisu + wymuś 2 zdania + przytnij
-    attr_hint = ""  # w razie potrzeby można dać skrót atrybutów
-    meta_description = ensure_two_sentences(meta_description, attr_hint)
-
-    # przytnij po słowach
+    meta_description = ensure_two_sentences(meta_description, "")
     meta_title = trim_words(meta_title, MAX_TITLE)
     meta_description = trim_words(meta_description, MAX_DESC)
-
-    # sprzątanie whitespace
     meta_title = re.sub(r"\s{2,}", " ", meta_title).strip(" -")
     meta_description = re.sub(r"\s{2,}", " ", meta_description).strip()
     return meta_title, meta_description
@@ -401,8 +383,6 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
 
     try:
         async with semaphore:
-            # OpenAI klient jest sync – ale I/O – uderzamy sync w wątku event loopa
-            # Streamlit/asyncio: użyj to_thread, żeby nie blokować pętli
             def call_openai():
                 return client.responses.create(
                     model=LLM_MODEL,
@@ -416,7 +396,6 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
                     reasoning={"effort": "medium"},
                     text={"verbosity": "low"},
                 )
-
             resp = await asyncio.to_thread(call_openai)
 
         txt = resp.output_text if hasattr(resp, "output_text") else ""
@@ -424,7 +403,6 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
         try:
             data = json.loads(txt)
         except Exception:
-            # czasem modele zwracają tekst poprzedzony śmieciami – spróbuj wyciągnąć blok JSON
             m = re.search(r"\{.*\}", txt, flags=re.S)
             if m:
                 data = json.loads(m.group(0))
@@ -434,7 +412,6 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
         mt = clean_text(data.get("meta_title", ""))
         md = clean_text(data.get("meta_description", ""))
 
-        # postprocess (ban brand/CTA, 2 zdania, limity po słowach)
         banned = [brand]
         mt, md = postprocess_llm_output(mt, md, banned)
 
@@ -453,15 +430,12 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
 
 # ----------------------- PIPELINE ------------------------------- #
 async def run_pipeline(urls: List[str], skus: List[str], llm_client: OpenAI) -> List[MetaResult]:
-    # 1) Scraping (asynchronicznie)
     scrape_tasks = [scrape_product(u) for u in urls]
     scraped: List[ProductData] = await asyncio.gather(*scrape_tasks)
 
-    # Dołącz SKU do obiektów
     for i, pd_obj in enumerate(scraped):
         pd_obj.sku = skus[i] if i < len(skus) else ""
 
-    # 2) Generacja metatagów (ograniczona równoległość)
     sem = asyncio.Semaphore(3)  # 3 równoległe wywołania LLM
     gen_tasks = [generate_for_product(llm_client, pd_obj, sem) for pd_obj in scraped]
     results: List[MetaResult] = []
@@ -477,7 +451,6 @@ async def run_pipeline(urls: List[str], skus: List[str], llm_client: OpenAI) -> 
             text=f"Generowanie metatagów: {completed}/{total}"
         )
 
-    # zachowaj kolejność URL-i
     idx_map = {u: i for i, u in enumerate(urls)}
     results_sorted = sorted(results, key=lambda x: idx_map.get(x.url, 10**9))
     return results_sorted
@@ -534,6 +507,12 @@ with col_btn2:
         st.session_state.results = []
         st.rerun()
 
+# Komunikat o trybie HTTP/2 (informacyjnie)
+if HTTP2_AVAILABLE:
+    st.caption("🔌 HTTP/2: włączony (wykryto pakiet `h2`).")
+else:
+    st.caption("🔌 HTTP/2: wyłączony (brak pakietu `h2`; działa HTTP/1.1).")
+
 st.session_state.progress_placeholder = st.empty()
 
 if gen_clicked:
@@ -550,7 +529,6 @@ if gen_clicked:
             skus = skus[: len(urls)]
 
         st.session_state.progress_placeholder.progress(0.0, text="Scraping danych produktów...")
-        # odpal pipeline
         try:
             results = asyncio.run(run_pipeline(urls, skus, client))
             st.session_state.results = results
@@ -577,7 +555,6 @@ if results:
         avg_desc = sum(r.meta_desc_length for r in successful) / len(successful)
         c4.metric("📏 Śr. długość title", f"{avg_title:.0f} zn.")
 
-    # Eksport CSV (tylko sukcesy)
     if successful:
         df = pd.DataFrame([
             {
@@ -601,7 +578,6 @@ if results:
             use_container_width=True,
         )
 
-    # Tabela
     st.markdown("---")
     st.subheader("📋 Tabela wyników")
 
@@ -660,7 +636,6 @@ if results:
             },
         )
 
-    # Panel diagnostyczny (opcjonalny podgląd surowych danych) – wyłączony domyślnie
     with st.expander("🛠️ Diagnostyka (dla ciekawych)"):
         st.write("Poniżej surowe dane wejściowe po scrapingu (pierwsze 3 pozycje):")
         diag = []
