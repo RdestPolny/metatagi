@@ -2,10 +2,8 @@
 # -*- coding: utf-8 -*-
 import asyncio
 import json
-import math
 import random
 import re
-import time
 import textwrap
 from dataclasses import dataclass, asdict
 from typing import Any, Dict, List, Optional, Tuple
@@ -60,13 +58,11 @@ ATTRIBUTE_KEYS = {
 }
 
 BROWSER_UAS = [
-    # kilkanaście popularnych UA – prosty rotating pool
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/127.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Safari/605.1.15",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
 ]
-
 SEC_CH = {
     "sec-ch-ua": '"Chromium";v="126", "Not;A=Brand";v="99", "Google Chrome";v="126"',
     "sec-ch-ua-mobile": "?0",
@@ -248,16 +244,14 @@ async def fetch_via_httpx(url: str, max_retries: int = 3) -> str:
                     raise httpx.HTTPStatusError("403 Forbidden", request=r.request, response=r)
                 r.raise_for_status()
                 return r.text
-        except Exception as e:
+        except Exception:
             if attempt == max_retries:
                 raise
-            # mały jitter, zmiana UA i sek-ch
             await asyncio.sleep(backoff + random.uniform(0, 0.6))
             backoff *= 1.6
     raise RuntimeError("Unreachable")
 
 def fetch_via_curlcffi(url: str) -> str:
-    # TLS fingerprint + JA3 jak Chrome – często wystarcza
     resp = curlreq.get(
         url,
         headers=base_headers(url),
@@ -279,25 +273,20 @@ def fetch_via_cloudscraper(url: str) -> str:
     return r.text
 
 async def robust_fetch_html(url: str) -> str:
-    # Plan A: httpx + retry
     try:
         return await fetch_via_httpx(url)
     except Exception as e_httpx:
-        # Plan B: curl_cffi (sync) – uruchom w wątku
+        last = f"httpx fail: {e_httpx}"
         if CURLCFFI_AVAILABLE:
             try:
                 return await asyncio.to_thread(fetch_via_curlcffi, url)
             except Exception as e_curl:
-                last = f"httpx fail: {e_httpx} | curl_cffi fail: {e_curl}"
-        else:
-            last = f"httpx fail: {e_httpx} | curl_cffi not installed"
-
-        # Plan C: cloudscraper (sync) – w wątku
+                last += f" | curl_cffi fail: {e_curl}"
         if CLOUDSCRAPER_AVAILABLE:
             try:
                 return await asyncio.to_thread(fetch_via_cloudscraper, url)
             except Exception as e_cloud:
-                raise RuntimeError(f"{last} | cloudscraper fail: {e_cloud}")
+                last += f" | cloudscraper fail: {e_cloud}"
         raise RuntimeError(last)
 
 # ----------------------- SCRAPER GŁÓWNY ------------------------- #
@@ -448,31 +437,29 @@ async def generate_for_product(client: OpenAI, pd: ProductData, semaphore: async
 
     try:
         async with semaphore:
+            # Używamy Chat Completions API (kompatybilne z response_format)
             def call_openai():
-                return client.responses.create(
+                resp = client.chat.completions.create(
                     model=LLM_MODEL,
-                    input=[
+                    messages=[
                         {"role": "system", "content": system_prompt},
                         {"role": "user", "content": user_prompt},
                     ],
-                    response_format={"type": "json_object"},
+                    response_format={"type": "json_object"},  # <- kluczowa różnica
                     temperature=0.2,
-                    seed=42,
-                    reasoning={"effort": "medium"},
-                    text={"verbosity": "low"},
                 )
+                return resp
             resp = await asyncio.to_thread(call_openai)
 
-        txt = resp.output_text if hasattr(resp, "output_text") else ""
-        data = {}
+        content = resp.choices[0].message.content if resp and resp.choices else ""
+        if not content:
+            raise ValueError("Pusta odpowiedź modelu.")
+
         try:
-            data = json.loads(txt)
+            data = json.loads(content)
         except Exception:
-            m = re.search(r"\{.*\}", txt, flags=re.S)
-            if m:
-                data = json.loads(m.group(0))
-            else:
-                raise ValueError(f"Nie udało się sparsować JSON: {txt[:200]}...")
+            m = re.search(r"\{.*\}", content, flags=re.S)
+            data = json.loads(m.group(0)) if m else {}
 
         mt = clean_text(data.get("meta_title", ""))
         md = clean_text(data.get("meta_description", ""))
@@ -501,7 +488,7 @@ async def run_pipeline(urls: List[str], skus: List[str], llm_client: OpenAI) -> 
     for i, pd_obj in enumerate(scraped):
         pd_obj.sku = skus[i] if i < len(skus) else ""
 
-    sem = asyncio.Semaphore(3)  # 3 równoległe wywołania LLM
+    sem = asyncio.Semaphore(3)
     gen_tasks = [generate_for_product(llm_client, pd_obj, sem) for pd_obj in scraped]
     results: List[MetaResult] = []
     completed = 0
@@ -571,7 +558,7 @@ with col_btn2:
         st.session_state.results = []
         st.rerun()
 
-# Info o trybie sieci
+# Informacja o trybie sieci
 net_bits = []
 net_bits.append("HTTP/2: TAK" if HTTP2_AVAILABLE else "HTTP/2: NIE")
 net_bits.append("curl_cffi: TAK" if CURLCFFI_AVAILABLE else "curl_cffi: NIE")
@@ -710,4 +697,4 @@ if results:
 
 # ----------------------- STOPKA ------------------------------- #
 st.markdown("---")
-st.markdown("🔧 **Generator Metatagów SEO – wersja PRO** | Anti-403 (TLS/impersonate), JSON-LD, walidacja 2 zdań, anty-CTA, myślnik „-”, bez brandu | Powered by OpenAI GPT-5-nano")
+st.markdown("🔧 **Generator Metatagów SEO – wersja PRO** | Anti-403, JSON-LD, walidacja 2 zdań, anty-CTA, myślnik „-”, bez brandu | Powered by OpenAI GPT-5-nano")
